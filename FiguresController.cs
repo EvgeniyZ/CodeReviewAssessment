@@ -161,6 +161,7 @@ namespace FiguresDotStore.Controllers
 
         // хотим оформить заказ и получить в ответе его стоимость
         [HttpPost]
+        //использовать DTO на вход и мапить на `Cart`, можно будет спокойно менять схему бд и сущность Cart без изменения схемы API. 
         public async Task<ActionResult> Order(Cart cart, CancellationToken cancellationToken = default) //использовать токен отмены для всех async методов, если потребитель решит отменить запрос
         {
             ValidateCart(cart);
