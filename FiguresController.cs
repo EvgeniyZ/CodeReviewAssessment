@@ -9,36 +9,42 @@ namespace FiguresDotStore.Controllers
 {
     internal interface IRedisClient
     {
+        //поискал бы async API у Redis
         int Get(string type);
         void Set(string type, int current);
     }
 
-    public static class FiguresStorage
+    // зарегистрировать в DI container с помощью .AddScoped<FiguresStorage>(). Для UT выделить интерфейс, если необходимо.
+    public sealed class FiguresStorage
     {
         // корректно сконфигурированный и готовый к использованию клиент Редиса
-        private static IRedisClient RedisClient { get; }
+        private readonly IRedisClient _redisClient;
 
-        public static bool CheckIfAvailable(string type, int count)
+        public FiguresStorage(IRedisClient redisClient)
         {
-            return RedisClient.Get(type) >= count;
+            _redisClient = redisClient;
         }
 
-        public static void Reserve(string type, int count)
+        public bool CheckIfAvailable(string type, int count)
         {
-            var current = RedisClient.Get(type);
+            return _redisClient.Get(type) >= count;
+        }
 
-            RedisClient.Set(type, current - count);
+        public void Reserve(string type, int count)
+        {
+            var current = _redisClient.Get(type);
+
+            _redisClient.Set(type, current - count);
         }
     }
 
-    public class Position
+    public sealed class Position
     {
-        public string Type { get; set; }
-
-        public float SideA { get; set; }
-        public float SideB { get; set; }
-        public float SideC { get; set; }
-
+        //вырезал лишние на мой взгляд поля SideA, SideB, SideC
+        //позиция в корзине и сущность фигура, обладающая тремя координатами - разные сущности.
+        
+        //заменил string Type на явное использование класса Figure
+        public Figure Figure { get; set; }
         public int Count { get; set; }
     }
 
@@ -62,16 +68,20 @@ namespace FiguresDotStore.Controllers
 
     public abstract class Figure
     {
-        public float SideA { get; set; }
-        public float SideB { get; set; }
-        public float SideC { get; set; }
+        //убираю поля SideA, SideB, SideC т.к. ненужное дублирование полей у Square (одна сторона) и Circle (радиус)
 
+        //по-хорошему, поменять семантику Validate, чтобы возвращал `string errorMessage` или bool TryValidate(out string errorMessage),
+        //чтобы избежать оверхеда на try-catch и не мапить исключение InvalidOperationException -> BadRequestResult
         public abstract void Validate();
         public abstract double GetArea();
     }
 
-    public class Triangle : Figure
+    public sealed class Triangle : Figure
     {
+        public float SideA { get; set; }
+        public float SideB { get; set; }
+        public float SideC { get; set; }
+        
         public override void Validate()
         {
             bool CheckTriangleInequality(float a, float b, float c) => a < b + c;
@@ -89,22 +99,27 @@ namespace FiguresDotStore.Controllers
         }
     }
 
-    public class Square : Figure
+    public sealed class Square : Figure
     {
+        //переименовать в `Side`, если есть возможность у потребителей перейти на новый нейминг
+        public float SideA { get; set; }
+
         public override void Validate()
         {
             if (SideA < 0)
                 throw new InvalidOperationException("Square restrictions not met");
 
-            if (SideA != SideB)
-                throw new InvalidOperationException("Square restrictions not met");
+            //Убираю проверку, зачем нам SideB если это квадрат?
         }
 
         public override double GetArea() => SideA * SideA;
     }
 
-    public class Circle : Figure
+    public sealed class Circle : Figure
     {
+        //переименовать в `Radius`, если есть возможность у потребителей перейти на новый нейминг
+        public float SideA { get; set; }
+
         public override void Validate()
         {
             if (SideA < 0)
@@ -126,51 +141,65 @@ namespace FiguresDotStore.Controllers
     {
         private readonly ILogger<FiguresController> _logger;
         private readonly IOrderStorage _orderStorage;
+        private readonly FiguresStorage _figuresStorage;
 
-        public FiguresController(ILogger<FiguresController> logger, IOrderStorage orderStorage)
+        public FiguresController(ILogger<FiguresController> logger, IOrderStorage orderStorage, FiguresStorage figuresStorage)
         {
             _logger = logger;
             _orderStorage = orderStorage;
+            _figuresStorage = figuresStorage;
         }
 
         // хотим оформить заказ и получить в ответе его стоимость
         [HttpPost]
         public async Task<ActionResult> Order(Cart cart)
         {
-            foreach (var position in cart.Positions)
-            {
-                if (!FiguresStorage.CheckIfAvailable(position.Type, position.Count))
-                {
-                    return new BadRequestResult();
-                }
-            }
-
+            ValidateCart(cart);
+            
             var order = new Order
             {
                 Positions = cart.Positions.Select(p =>
                 {
-                    Figure figure = p.Type switch
-                    {
-                        "Circle" => new Circle(),
-                        "Triangle" => new Triangle(),
-                        "Square" => new Square()
-                    };
-                    figure.SideA = p.SideA;
-                    figure.SideB = p.SideB;
-                    figure.SideC = p.SideC;
-                    figure.Validate();
-                    return figure;
+                    //убираю Validate() т.к. валидация происходит выше
+                    return p.Figure;
                 }).ToList()
             };
 
+            //Резерв и сохранение заказа вынести в сервисный (application) слой, т.к. это бизнес-логика обработки заказа. При желании, унести валидацию корзины туда же.
+            //Нет обработки негативных сценариев если FiguresStorage отвалился и\или orderStorage.
+            //Если FiguresStorage недоступен, будет 500. Если сделали резерв по товарам корзины, но orderStorage недоступен - что делать?
             foreach (var position in cart.Positions)
             {
-                FiguresStorage.Reserve(position.Type, position.Count);
+                _figuresStorage.Reserve(position.Type, position.Count);
             }
 
             var result = _orderStorage.Save(order);
 
             return new OkObjectResult(result.Result);
+        }
+
+        private void ValidateCart(Cart cart)
+        {
+            // нет проверки на null в корзине, нужен ли нам создавать заказ, у которого корзина пуста?
+            foreach (var position in cart.Positions)
+            {
+                // такие проверки на доступность товара не сработают т.к. возможно параллельное создание заказов по одному типу геометрических фигур.
+                // в зависимости от требований бизнеса по перфомансу, я бы ставил создание заказа в редис очередь (TODO: - обдумать как залочить строки в редисе)
+                if (!_figuresStorage.CheckIfAvailable(position.Type, position.Count))
+                {
+                    //добавить понятное сообщение об ошибке
+                    return new BadRequestResult();
+                }
+
+                try
+                {
+                    position.Figure.Validate();
+                }
+                catch (InvalidOperationException e)
+                {
+                    return new BadRequestResult(e.Message);
+                }
+            }
         }
     }
 }
