@@ -25,16 +25,25 @@ namespace FiguresDotStore.Controllers
             _redisClient = redisClient;
         }
 
-        public bool CheckIfAvailable(string type, int count)
-        {
-            return _redisClient.Get(type) >= count;
-        }
+        // такие проверки на доступность товара не сработают т.к. возможно параллельное создание заказов по одному типу геометрических фигур.
+        // проверять надо на этапе резервации товара, после валидации самой корзины.
 
-        public void Reserve(string type, int count)
+        // public bool CheckIfAvailable(string type, int count)
+        // {
+        //     return _redisClient.Get(type) >= count;
+        // }
+
+        public bool TryReserve(string type, int count)
         {
             var current = _redisClient.Get(type);
+            var remains = current - count;
+            if (remains <= 0)
+            {
+                return false;
+            }
 
-            _redisClient.Set(type, current - count);
+            _redisClient.Set(type, remains);
+            return true;
         }
     }
 
@@ -152,10 +161,10 @@ namespace FiguresDotStore.Controllers
 
         // хотим оформить заказ и получить в ответе его стоимость
         [HttpPost]
-        public async Task<ActionResult> Order(Cart cart)
+        public async Task<ActionResult> Order(Cart cart, CancellationToken cancellationToken = default) //использовать токен отмены для всех async методов, если потребитель решит отменить запрос
         {
             ValidateCart(cart);
-            
+
             var order = new Order
             {
                 Positions = cart.Positions.Select(p =>
@@ -166,14 +175,21 @@ namespace FiguresDotStore.Controllers
             };
 
             //Резерв и сохранение заказа вынести в сервисный (application) слой, т.к. это бизнес-логика обработки заказа. При желании, унести валидацию корзины туда же.
-            //Нет обработки негативных сценариев если FiguresStorage отвалился и\или orderStorage.
-            //Если FiguresStorage недоступен, будет 500. Если сделали резерв по товарам корзины, но orderStorage недоступен - что делать?
+
+            //Обработка заказа (резервация и сохранение), прошедшего валидацию, должна быть реализована через очередь сообщений, которую обрабатывает отдельный Consumer,
+            //исключая race conditions за резервацию позиций.
+
+            //Нет обработки негативных сценариев если отвалился orderStorage. Если FiguresStorage недоступен, будет 500.
+            //Если сделали резерв по товарам корзины, но orderStorage недоступен - что делать?
             foreach (var position in cart.Positions)
             {
-                _figuresStorage.Reserve(position.Type, position.Count);
+                if (!_figuresStorage.TryReserve(position.Type, position.Count))
+                {
+                    return new BadObjectResult();
+                }
             }
 
-            var result = _orderStorage.Save(order);
+            var result = await _orderStorage.Save(order, cancellationToken);
 
             return new OkObjectResult(result.Result);
         }
@@ -183,14 +199,6 @@ namespace FiguresDotStore.Controllers
             // нет проверки на null в корзине, нужен ли нам создавать заказ, у которого корзина пуста?
             foreach (var position in cart.Positions)
             {
-                // такие проверки на доступность товара не сработают т.к. возможно параллельное создание заказов по одному типу геометрических фигур.
-                // в зависимости от требований бизнеса по перфомансу, я бы ставил создание заказа в редис очередь (TODO: - обдумать как залочить строки в редисе)
-                if (!_figuresStorage.CheckIfAvailable(position.Type, position.Count))
-                {
-                    //добавить понятное сообщение об ошибке
-                    return new BadRequestResult();
-                }
-
                 try
                 {
                     position.Figure.Validate();
